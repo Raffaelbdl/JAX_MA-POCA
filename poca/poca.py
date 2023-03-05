@@ -1,16 +1,19 @@
 from typing import Callable, List, Tuple
 
-from einops import rearrange
 import haiku as hk
 import jax
 import jax.numpy as jnp
 import jax.random as jrd
-import rlax
+import optax
+import numpy as np
+from rlax import clipped_surrogate_pg_loss
 from rlax._src import multistep
 
-from poca.buffer import POCABuffer
+from poca.buffer import SimpleAgentBuffer
 from poca.networks import PolicyNetwork
 from poca.networks import CriticNetwork
+
+from minimalistic_rl.utils import apply_updates
 
 
 def get_policy(config) -> Tuple[hk.Transformed, hk.Params]:
@@ -53,60 +56,58 @@ def get_critic(config) -> Tuple[hk.Transformed, hk.Params]:
 
 def get_poca_loss_fn(config, policy_fwd, critic_fwd) -> Callable:
     def critic_baseline_loss(params, batch):
-        obs = batch["obs"]  # [B, T, N, size]
-        actions = batch["actions"]  # B, T, N
-        reward = batch["rewards"]  # B, T
-        discount = batch["discounts"]  # B, T
-        next_obs = batch["next_obs"]  # [B, T, N, size]
-
-        def get_lambda_returns(r_t, discount_t, o_t):
-            v_t = critic_fwd(params, None, o_t, None, None)[..., 0]  # value
-            return multistep.lambda_returns(
-                r_t, discount_t, v_t, config["lambda"], True
+        # trust region value loss
+        def clipped_loss(new_values, old_values, returns):
+            clipped_values = old_values + jnp.clip(
+                new_values - old_values, -config["epsilon"], config["epsilon"]
             )
+            v1 = jnp.square(returns - values)
+            v2 = jnp.square(returns - clipped_values)
+            return jnp.mean(jnp.fmax(v1, v2))
 
-        lambda_returns = jax.vmap(get_lambda_returns, in_axes=0, out_axes=0)(
-            reward, discount, next_obs
-        )  # B, T
+        obs = batch["obs"]  # [B, N, size]
+        actions = batch["actions"]  # B, N
+        returns = batch["returns"]
 
         # values
-        values = jax.vmap(
-            critic_fwd,
-            in_axes=(None, None, 1, None, None),
-            out_axes=1,
-        )(
-            params, None, obs, None, None
-        )[..., 0]
-        v_loss = -jnp.square(values - lambda_returns)  # B, T
+        old_values = batch["values"]
+        values = critic_fwd(params, None, obs, None, None)[..., 0]
+
+        v_loss = clipped_loss(values, old_values, returns)
 
         # baselines
-        b_obs_only, b_obs, b_actions = get_baselines_input(
-            obs, actions
-        )  # B, T, N, size
+        old_baselines = batch["baselines"]
+        b_obs_only, b_obs, b_actions = get_baselines_input(obs, actions)  # [B, N, size]
 
-        baselines = jax.vmap(critic_fwd, in_axes=(None, None, 1, 1, 1), out_axes=1)(
-            params, None, b_obs_only, b_obs, b_actions[..., None]
-        )[..., 0]
+        baselines = critic_fwd(params, None, b_obs_only, b_obs, b_actions[..., None])[
+            ..., 0
+        ]
 
-        b_loss = -jnp.square(baselines - lambda_returns)  # B, T
+        b_loss = clipped_loss(baselines, old_baselines, returns)
 
-        return config["b_coef"] * jnp.mean(b_loss) + config["v_coef"] * jnp.mean(v_loss)
+        return config["b_coef"] * b_loss + config["v_coef"] * v_loss
 
     def policy_loss(params, key, batch):
-        obs = batch["obs"]  # B, T, N, size
-        log_probs = batch["log_probs"]  # B, T, N
-        advantages = batch["advantages"]  # B, T, N
+        # trust region policy loss
+
+        obs = batch["obs"]  # B, N, size
+        log_probs = batch["log_probs"]  # B, N
+        advantages = batch["advantages"]  # B,
 
         dist = policy_fwd(params, None, obs)
-        _, new_log_probs = dist.sample_and_log_prob(seed=key)  # B, T, N
+        _, new_log_probs = dist.sample_and_log_prob(seed=key)  # B, N
 
-        ratio = jnp.exp(new_log_probs - log_probs)  # B, T, N
-        return -jnp.mean(ratio * advantages) - config["entropy_coef"] * dist.entropy()
+        ratio = jnp.exp(new_log_probs - log_probs)  # B, N
+
+        policy_loss = jax.vmap(
+            clipped_surrogate_pg_loss, in_axes=(1, None, None, None)
+        )(ratio, advantages, config["epsilon"], True)
+
+        return jnp.mean(policy_loss) - config["entropy_coef"] * jnp.mean(dist.entropy())
 
     def poca_loss(params, key, batch):
         return critic_baseline_loss(params, batch) + policy_loss(params, key, batch)
 
-    # TODO JIT
     return poca_loss
 
 
@@ -119,51 +120,109 @@ class POCA:
         self.params = hk.data_structures.merge(self.policy_params, self.critic_params)
 
         self.loss_fn = get_poca_loss_fn(config, self.policy_fwd, self.critic_fwd)
+        self.loss_fn = jax.jit(self.loss_fn)
 
-        self.buffer = POCABuffer(config)
+        self.buffer = SimpleAgentBuffer()
 
         self.discount = config["discount"]
         self._lambda = config["lambda"]
 
+        self.buffer_capacity = config["buffer_capacity"]
+        self.n_epochs = config["n_epochs"]
+        self.n_minibatchs = config["n_minibatchs"]
+        self.batch_size = self.buffer_capacity // self.n_minibatchs
+
+        self.learning_rate = config["learning_rate"]
+        self.optimizer, self.opt_state = self.init_optimizer()
+
     def get_action(self, obs: List[jnp.ndarray]):
-        # TODO JIT
-        dist = self.policy_fwd(self.params, None, obs)
+        dist = jax.jit(self.policy_fwd)(self.params, None, obs)
         return dist.sample_and_log_prob(seed=self._next_rng_key())
 
-    def improve(self):
-        pass
+    def improve(self, logs: dict):
+        data = self.prepare_data()
+        idx = np.arange(len(data["rewards"]))
+
+        loss_list = []
+        for e in range(self.n_epochs):
+            idx = jrd.permutation(self._next_rng_key(), idx, independent=True)
+            for i in range(self.n_minibatchs):
+                _idx = idx[i * self.batch_size : (i + 1) * self.batch_size]
+                batch = get_batch(data, _idx)
+
+                loss, grads = jax.value_and_grad(self.loss_fn)(
+                    self.params, self._next_rng_key(), batch
+                )
+
+                self.params, self.opt_state = apply_updates(
+                    self.optimizer, self.params, self.opt_state, grads
+                )
+
+                loss_list.append(loss)
+
+        logs["loss"] = sum(loss_list) / len(loss_list)
+
+        self.buffer.reset()
+
+        return logs
+
+    @property
+    def improve_condition(self) -> bool:
+        return len(self.buffer) >= self.buffer_capacity
 
     def prepare_data(self):
         buffer = self.buffer.sample()
         data = {}
+        # T * [types * [N, size']] --> types * [T, N, size']
+        obs = [[] for _ in range(len(buffer["obs"][0]))]
+        next_obs = [[] for _ in range(len(buffer["obs"][0]))]
+        for t in range(len(buffer["obs"])):
+            o = buffer["obs"][t]
+            no = buffer["next_obs"][t]
+            for i in range(len(o)):
+                obs[i].append(o[i])
+                next_obs[i].append(no[i])
 
-        data["obs"] = [jnp.stack(obs, axis=0) for obs in buffer["obs"]]  # T, N, size
+        data["obs"] = [jnp.stack(o, axis=0) for o in obs]
+        data["next_obs"] = [jnp.stack(o, axis=0) for o in next_obs]
+
         data["actions"] = jnp.stack(buffer["actions"], axis=0)
         data["rewards"] = jnp.stack(buffer["rewards"], axis=0)  # T
         data["dones"] = jnp.stack(buffer["dones"], axis=0)  # T
-        data["next_obs"] = [jnp.stack(obs, axis=0) for obs in buffer["next_obs"]]
         data["log_probs"] = jnp.stack(buffer["log_probs"], axis=0)
 
         data["discounts"] = self.discount * jnp.where(data["dones"], 0.0, 1.0)
-
-        next_values = self.critic_fwd(self.params, None, data["next_obs"], None, None)[
-            ..., 0
-        ]
-        lambda_returns = multistep.lambda_returns(
+        next_values = jax.jit(self.critic_fwd)(
+            self.params, None, data["next_obs"], None, None
+        )[..., 0]
+        lambda_returns = jax.jit(multistep.lambda_returns, static_argnums=(4))(
             data["rewards"], data["discounts"], next_values, self._lambda, True
         )
 
-        b_obs_only, b_obs, b_actions = get_baselines_input(
-            [obs[None, ...] for obs in data["obs"]], data["actions"][None, ...]
-        )  # 1, T, N, size
+        b_obs_only, b_obs, b_actions = jax.jit(get_baselines_input)(
+            [obs for obs in data["obs"]], data["actions"]
+        )  # [T, N, size]
 
-        baselines = jax.vmap(
-            self.critic_fwd, in_axes=(None, None, 1, 1, 1), out_axes=1
-        )(self.params, None, b_obs_only, b_obs, b_actions[..., None])[0, ..., 0]
+        baselines = jax.jit(self.critic_fwd)(
+            self.params, None, b_obs_only, b_obs, b_actions[..., None]
+        )[..., 0]
 
+        values = jax.jit(self.critic_fwd)(self.params, None, data["obs"], None, None)[
+            ..., 0
+        ]
+
+        data["returns"] = lambda_returns
         data["advantages"] = lambda_returns - baselines
 
+        data["baselines"] = baselines
+        data["values"] = values
+
         return data
+
+    def init_optimizer(self):
+        optimizer = optax.adam(self.learning_rate)
+        opt_state = optimizer.init(self.params)
+        return optimizer, opt_state
 
     def _next_rng_key(self):
         self.key, key1 = jrd.split(self.key)
@@ -173,9 +232,9 @@ class POCA:
 def get_baselines_input(
     obs: List[jnp.ndarray], actions
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    # actions shape : B, T, N
-    # obs shape : [B, T, N, size]
-    n_agents = actions.shape[2]
+    # actions shape : B, N
+    # obs shape : [B, N, size]
+    n_agents = actions.shape[1]
 
     new_obs_only = []
     new_obs = []
@@ -187,20 +246,31 @@ def get_baselines_input(
         i_excluded = list(range(n_agents)).pop(i)
 
         for o in obs:
-            _new_obs_only.append(o[:, :, i])
-            _new_obs.append(o[:, :, i_excluded])
+            _new_obs_only.append(o[:, i])
+            _new_obs.append(o[:, i_excluded])
 
         new_obs_only.append(_new_obs_only)
         new_obs.append(_new_obs)
-        new_actions.append(actions[:, :, i_excluded])
+        new_actions.append(actions[:, i_excluded])
 
-    # B, T, N, size
+    # B, N, size
     new_obs_only = zip(*new_obs_only)
-    new_obs_only = [jnp.stack(noo, axis=2) for noo in new_obs_only]
+    new_obs_only = [jnp.stack(noo, axis=1) for noo in new_obs_only]
 
     new_obs = zip(*new_obs)
-    new_obs = [jnp.stack(no, axis=2) for no in new_obs]
+    new_obs = [jnp.stack(no, axis=1) for no in new_obs]
 
-    new_actions = jnp.stack(new_actions, axis=2)
+    new_actions = jnp.stack(new_actions, axis=1)
 
     return new_obs_only, new_obs, new_actions
+
+
+def get_batch(data: dict, idx: np.array):
+    batch = {}
+    for key, value in data.items():
+        if key in ("obs", "next_obs"):
+            batch[key] = [v[idx] for v in value]
+        else:
+            batch[key] = value[idx]
+
+    return batch

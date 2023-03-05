@@ -14,4 +14,9 @@ CONFIG = {
     "b_coef": 1.0,
     "v_coef": 0.5,
     "entropy_coef": 0.02,
+    "buffer_capacity": 256,
+    "n_epochs": 1,
+    "n_minibatchs": 4,
+    "learning_rate": 3e-4,
+    "epsilon": 0.2,
 }
