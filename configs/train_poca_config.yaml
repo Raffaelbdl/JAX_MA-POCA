@@ -1,0 +1,22 @@
+seed : 0
+name : "poca"
+
+embed_size : 256
+
+normalize : true
+gamma : 0.99
+lambda : 0.95
+epsilon : 0.2
+entropy_coef : 0.01
+value_coef : 0.5
+baseline_coef : 0.25
+
+learning_rate : 0.00025
+learning_rate_annealing : true
+max_gradient_norm : 0.5
+
+n_epochs : 3
+batch_size : 512
+n_envs : 16
+n_steps_per_trajectory : 128
+n_env_steps : 15_000_000
