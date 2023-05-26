@@ -1,21 +1,7 @@
-"""Training on MA-HalfCheetah"""
-from copy import copy
-from typing import List, Optional, Type
-
 from einops import rearrange
-import distrax as dx
-import haiku as hk
 import jax
-import jax.lax as jlax
-import jax.nn as jnn
 import jax.numpy as jnp
-import jax.random as jrd
-import numpy as np
-import optax
 
-from rltools.agent import Agent
-from rltools.buffer import get_batch, OnPolicyBuffer
-from rltools.update import update, avg
 from rlax import lambda_returns
 
 from poca.baseline_input import make_baseline_inputs
